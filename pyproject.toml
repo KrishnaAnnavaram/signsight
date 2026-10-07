@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signsight"
+version = "0.1.0"
+description = "Weather-robust traffic-sign recognition"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=10.0",
+    "scikit-learn>=1.4",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.1"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+signsight = "signsight.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
