@@ -461,9 +461,8 @@ All numbers come from the **synthetic** signs (10 classes, 12 tracks of 10 frame
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **25 passed**, 1 skipped (PyTorch absent) | `pytest -q` in a fresh venv |
+| Unit tests (CI installs only `.[dev]`) | **25 passed**, 1 skipped (PyTorch absent) | `pytest -q` |
 | Unit tests with PyTorch | **26 passed** | `pip install -e ".[dev,torch]"`, `pytest -q` |
-| Expected CI (fresh venv, `pip install -e ".[dev]"`) | **25 passed**, 1 skipped | `.github/workflows/ci.yml` |
 | `baseline` | clean accuracy 0.947 ± 0.034, corrupt accuracy 0.413 ± 0.011, mCE 1.000 | `signsight demo` |
 | `augmented` | clean accuracy 0.928 ± 0.032, corrupt accuracy 0.600 ± 0.024, mCE 0.685 ± 0.027 | `signsight demo` |
 | `augmented_condition` | clean accuracy 0.926 ± 0.022, corrupt accuracy 0.597 ± 0.021, mCE 0.688 ± 0.024 | `signsight demo` |
