@@ -73,6 +73,7 @@ This README is the **one location that explains all of signsight**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one photo](#42-the-life-cycle-of-one-photo)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📥 [Data and the track split](#5-data-and-the-track-split)
 6. 🌫️ [Corruptions and augmentation](#6-corruptions-and-augmentation)
 7. 🔵 [The HOG classifier](#7-the-hog-classifier)
@@ -141,6 +142,45 @@ flowchart LR
 | Pipeline | `src/signsight/pipeline.py` | Prediction for files, latency for each stage |
 | CLI | `src/signsight/cli.py` | The `signsight` command with 7 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>signsight command"]
+    CFG["config.py<br/>Settings, load_dotenv"]
+    subgraph DATAIN["Data in"]
+        DATA["data.py<br/>load_gtsrb_train, load_gtsrb_test,<br/>track_split, image_split"]
+        SYN["synthetic.py<br/>make_signs, make_scene"]
+    end
+    subgraph MODELS["Models"]
+        HOG["models/hog.py<br/>HogClassifier, ConditionModel"]
+        CNN["models/cnn.py<br/>CnnClassifier, extra torch"]
+        FEAT["features.py<br/>hog, colour, condition_cues"]
+    end
+    COR["corruptions.py<br/>CORRUPTIONS, augment, corrupt_batch"]
+    EVA["evaluate.py<br/>clean_metrics, corruption_suite,<br/>ablation, leakage_gap"]
+    subgraph PHOTO["Photos"]
+        PIPE["pipeline.py<br/>predict_files, latency"]
+        DET["detect.py<br/>detect"]
+    end
+
+    CLI --> CFG
+    CLI --> DATA
+    CLI --> SYN
+    CLI --> HOG
+    CLI -. "SIGNSIGHT_BACKEND=cnn" .-> CNN
+    CLI --> EVA
+    CLI --> PIPE
+    SYN --> DATA
+    HOG --> FEAT
+    HOG --> COR
+    CNN --> COR
+    EVA --> COR
+    EVA --> DATA
+    PIPE --> DET
+    PIPE --> DATA
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -180,6 +220,20 @@ signsight/
 ### 3.2 The test part never guides training
 The CNN stops early on the validation part. With `--test-images` and `--test-gt`, the official GTSRB test set gives the final numbers, and nothing else uses it.
 
+```mermaid
+flowchart LR
+    DATA[/"Training images<br/>GTSRB or synthetic"/] --> SPLIT["track_split"]
+    SPLIT --> TR["train part"]
+    SPLIT --> VA["validation part"]
+    TR --> FIT["fit: augment, features,<br/>classifier"]
+    VA --> ES["CNN early stopping:<br/>validation loss, patience 3"]
+    ES --> FIT
+    FIT --> EVAL["clean_metrics,<br/>corruption_suite"]
+    OT[/"Official GTSRB test<br/>--test-images, --test-gt"/] -. "if given" .-> EVAL
+    VA -. "if no test set" .-> EVAL
+    EVAL --> REP[/"Final numbers only:<br/>metrics.json, benchmark.json"/]
+```
+
 ### 3.3 Robustness is measured, not assumed
 Each model is evaluated on corrupted copies of the held-out images, for each corruption and severity. The augmentation uses only fog, rain and glare, so snow, blur and night measure the transfer to unseen effects.
 
@@ -202,26 +256,59 @@ Data, corruptions, splits, models and the ablation use explicit seeds. Each comm
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    SRC{"Data"} -- "synthetic" --> SYN["make_signs"]
-    SRC -- "GTSRB zip or folder" --> GT["load_gtsrb_train: ROI crop, resize"]
-    SYN --> SPLIT["track_split (seed)"]
+flowchart TD
+    IN[/"--data: synthetic,<br/>or a GTSRB zip or folder"/] --> SRC{"Data source"}
+    SRC -- "synthetic" --> SYN["make_signs"]
+    SRC -- "GTSRB zip or folder" --> GT["load_gtsrb_train:<br/>ROI crop, resize"]
+    SYN --> SPLIT["track_split, seed"]
     GT --> SPLIT
-    SPLIT -- "train" --> AUG["augment: fog, rain, glare copies"]
-    AUG --> COND["ConditionModel (optional)"]
+    SPLIT -- "train" --> AQ{"--augment or an<br/>augmented variant?"}
+    AQ -- "yes" --> AUG["augment: fog, rain,<br/>glare copies"]
+    AQ -- "no" --> FIT
+    AUG --> COND["ConditionModel<br/>augmented_condition only"]
     AUG --> FIT["HogClassifier or CnnClassifier"]
     COND --> FIT
-    SPLIT -- "validation" --> ES["early stopping (CNN)"]
+    SPLIT -- "validation" --> ES["Early stopping, CNN"]
     ES --> FIT
-    FIT --> CLEAN["clean metrics"]
-    FIT --> SUITE["corruption suites: 6 corruptions x severities"]
-    OT["official GTSRB test (optional)"] --> CLEAN
+    FIT --> CLEAN["clean_metrics"]
+    FIT --> SUITE["corruption_suite:<br/>6 corruptions × severities"]
+    OT[/"Official GTSRB test, optional"/] --> CLEAN
     OT --> SUITE
-    CLEAN --> REP["metrics.json, benchmark.json"]
+    CLEAN --> REP[("runs/<br/>model.joblib, metrics.json, benchmark.json")]
     SUITE --> REP
+    REP --> HUMAN{{"HUMAN<br/>researcher reads the<br/>robustness report"}}
+    PH[/"Folder of photos"/] --> PRED["predict, latency:<br/>detect, crop, classify"]
+    REP --> PRED
+    PRED --> OUT[/"Class, confidence and box,<br/>or unknown"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one photo
+
+```mermaid
+stateDiagram-v2
+    state "Image file in the folder" as Listed
+    state "RGB image" as Rgb
+    state "Sign box with padding" as Boxed
+    state "Full image, no box" as NoBox
+    state "Crop at SIGNSIGHT_IMAGE_SIZE" as Crop
+    state "Class probabilities" as Proba
+    state "Known class" as Known
+    state "unknown" as Unknown
+    [*] --> Listed: list_images, image suffix
+    Listed --> Rgb: Image.open, convert to RGB
+    Rgb --> Boxed: detect finds a coloured area
+    Rgb --> NoBox: no area large enough, or no-detect option
+    Boxed --> Crop: crop_resize of the box
+    NoBox --> Crop: crop_resize of the full image
+    Crop --> Proba: model.predict_proba
+    Proba --> Known: top probability at or above min-confidence
+    Proba --> Unknown: top probability below min-confidence
+    Known --> [*]: print class, confidence, box
+    Unknown --> [*]: print unknown, confidence, box
+```
 
 1. `list_images` finds the photo in the folder.
 2. The pipeline reads the photo and converts it to RGB.
@@ -231,11 +318,62 @@ flowchart TB
 6. If the top probability is below `--min-confidence`, the answer is `unknown`.
 7. The CLI prints the class, the confidence and the box.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as signsight CLI
+    participant DATA as data.py
+    participant MOD as HogClassifier
+    participant EVA as evaluate.py
+    participant FS as runs/ folder
+    participant PIPE as pipeline.py
+
+    R->>CLI: signsight train --augment
+    CLI->>CLI: load_dotenv, Settings.from_env
+    CLI->>DATA: make_signs or load_gtsrb_train
+    CLI->>DATA: track_split(data, seed)
+    DATA-->>CLI: train and validation parts
+    CLI->>CLI: print the counts and the shared tracks
+    CLI->>MOD: fit(train images, train labels)
+    MOD->>MOD: augment, sign_features, StandardScaler, LogisticRegression
+    CLI->>EVA: clean_metrics(model, target)
+    CLI->>EVA: corruption_suite, severities 1, 3, 5
+    EVA-->>CLI: accuracy, macro-F1, ECE, suite
+    CLI->>FS: model.joblib, metrics.json
+    CLI-->>R: clean and corruption summary
+    R->>CLI: signsight predict --model --images
+    CLI->>FS: joblib.load model.joblib
+    CLI->>PIPE: predict_files(model, class_names, paths)
+    PIPE->>PIPE: detect, crop_resize, predict_proba
+    PIPE-->>CLI: list of Prediction
+    CLI-->>R: file, class or unknown, confidence, box
+```
+
 ---
 
 ## 5. Data and the track split
 
 **Purpose.** Load sign crops and split them so that no physical sign is in two parts.
+
+```mermaid
+flowchart TD
+    IN[/"--data value"/] --> Q{"synthetic?"}
+    Q -- "yes" --> MS["make_signs: tracks_per_class,<br/>frames, the sign grows"]
+    Q -- "no" --> Z{"Suffix .zip?"}
+    Z -- "yes" --> ZR["Find GT-*.csv in the zip"]
+    Z -- "no" --> FR["Find GT-*.csv in the folder"]
+    ZR --> NG{"No GT file?"}
+    FR --> NG
+    NG -- "yes" --> ERR[/"DataError"/]
+    NG -- "no" --> ROW["Each row: ROI crop, resize,<br/>ClassId, track ID from the file name"]
+    ROW --> SET["ImageSet: images, labels,<br/>groups, class_names"]
+    MS --> SET
+    SET --> SPL["track_split: StratifiedGroupKFold,<br/>5 folds, shuffle, seed"]
+    SPL --> OUT[/"First fold: train part<br/>and validation part"/]
+```
 
 | Source | Reader | Track ID |
 |---|---|---|
@@ -252,6 +390,22 @@ flowchart TB
 ---
 
 ## 6. Corruptions and augmentation
+
+**Purpose.** Make seeded weather and light effects for training copies and for the evaluation suites.
+
+```mermaid
+flowchart LR
+    subgraph TRAIN["Training: augment"]
+        T1[/"Training images,<br/>share 0.5"/] --> T2["Seeded pick<br/>of images"]
+        T2 --> T3["Random corruption from fog,<br/>rain, glare, severity 1 to 5"]
+        T3 --> T4[/"Clean images + corrupted copies,<br/>condition labels 0 to 3"/]
+    end
+    subgraph EVAL["Evaluation: corrupt_batch"]
+        E1[/"Held-out images"/] --> E2["For each of the 6 corruptions<br/>and each severity"]
+        E2 --> E3["Fixed seed:<br/>seed + 100 × k + severity"]
+        E3 --> E4[/"Corrupted copies<br/>for one suite cell"/]
+    end
+```
 
 | Corruption | Effect | Used in augmentation |
 |---|---|---|
@@ -274,6 +428,24 @@ flowchart TB
 
 **Purpose.** A fast, offline classifier that runs on a CPU.
 
+```mermaid
+flowchart LR
+    IN[/"Training images<br/>and labels"/] --> A{"augment_share<br/>above 0?"}
+    A -- "yes" --> AUG["augment: add<br/>corrupted copies"]
+    A -- "no" --> F["sign_features"]
+    AUG --> F
+    F --> H["hog: 8 × 8 cells, 9 bins,<br/>2 × 2 blocks, L2-Hys"]
+    F --> C["colour: 8-bin RGB histograms<br/>+ mean colour"]
+    H --> X["Feature row:<br/>324 + 27 values at 32 px"]
+    C --> X
+    X --> UC{"use_condition?"}
+    UC -- "yes" --> CP["Add 4 condition<br/>probabilities, section 8"]
+    UC -- "no" --> SC["StandardScaler"]
+    CP --> SC
+    SC --> LOG["LogisticRegression C 0.5,<br/>class_weight balanced"]
+    LOG --> OUT[/"predict_proba, predict"/]
+```
+
 | Step | Value |
 |---|---|
 | Gradient features | HOG, 8 × 8 px cells, 9 direction bins, 2 × 2 blocks, L2-Hys |
@@ -289,6 +461,20 @@ At 32 px, the HOG part has 324 values and the colour part has 27 values.
 
 **Purpose.** Give the classifier a condition input that changes with each image.
 
+```mermaid
+flowchart TD
+    CHK{"augment_share above 0?"} -- "no" --> ERR[/"ValueError: use_condition<br/>needs augmented training data"/]
+    CHK -- "yes" --> IN[/"Augmented training images<br/>and condition labels"/]
+    IN --> CUES["condition_cues: 7 values<br/>brightness, contrast, saturation,<br/>edge density, bright share, p5, p95"]
+    CUES --> FIT["ConditionModel.fit:<br/>StandardScaler, LogisticRegression"]
+    CUES --> OOF["cross_val_predict,<br/>cv 3, predict_proba"]
+    OOF --> TRX[/"4 out-of-fold probabilities<br/>added to the training features"/]
+    NEW[/"New or held-out images"/] --> CUES2["condition_cues"]
+    CUES2 --> PP["ConditionModel.predict_proba"]
+    FIT --> PP
+    PP --> PX[/"4 probabilities added<br/>to the sign features"/]
+```
+
 **Procedure**
 
 1. Calculate 7 condition cues of each image: mean brightness, contrast, saturation, edge density, share of bright pixels, and the 5th and 95th brightness percentiles.
@@ -303,12 +489,35 @@ At 32 px, the HOG part has 324 values and the colour part has 27 values.
 
 **Purpose.** A small convolutional network for larger datasets (extra `torch`).
 
+```mermaid
+flowchart TD
+    IN[/"Training images, labels,<br/>validation part"/] --> W["Class weights from counts,<br/>torch.manual_seed"]
+    W --> EP["Epoch: shuffle the order"]
+    EP --> B["Batch of 128"]
+    B --> AU["augment_share of the batch:<br/>random fog, rain or glare"]
+    AU --> ST["Forward, weighted cross-entropy,<br/>backward, Adam step"]
+    ST --> MORE{"More batches?"}
+    MORE -- "yes" --> B
+    MORE -- "no" --> VL{"Validation part given?"}
+    VL -- "yes" --> L["Validation loss"]
+    VL -- "no" --> NXT{"More epochs?"}
+    L --> BEST{"Lower than the<br/>best loss − 0.0001?"}
+    BEST -- "yes" --> SAVE["Keep a copy of the state,<br/>reset the patience count"]
+    BEST -- "no" --> BAD{"3 epochs<br/>with no gain?"}
+    SAVE --> NXT
+    BAD -- "no" --> NXT
+    BAD -- "yes" --> STOP["Load the best state"]
+    NXT -- "yes" --> EP
+    NXT -- "no" --> STOP
+    STOP --> OUT[/"CnnClassifier:<br/>softmax predict_proba"/]
+```
+
 | Item | Value |
 |---|---|
 | Layers | 2 × (conv 32) → pool → 2 × (conv 64) → pool → conv 128 → global average pool → dropout 0.3 → linear |
 | Loss | Cross-entropy with class weights |
 | Optimizer | Adam, learning rate 0.002, batch 128 |
-| Augmentation | On each training batch, 50 % of images get a random fog, rain or glare corruption |
+| Augmentation | With `--augment` or the `augmented` variant: on each training batch, 50 % of images get a random fog, rain or glare corruption. The `baseline` variant uses 0 % |
 | Early stopping | Validation loss, patience 3, the best state is kept |
 | Epochs | `SIGNSIGHT_EPOCHS` (default 15) |
 
@@ -317,6 +526,24 @@ At 32 px, the HOG part has 324 values and the colour part has 27 values.
 ## 10. The robustness benchmark
 
 **Purpose.** Compare the variants over several seeds on clean and corrupted images.
+
+```mermaid
+flowchart TD
+    IN[/"ImageSet, variants,<br/>SIGNSIGHT_SEEDS seeds from SIGNSIGHT_SEED"/] --> S["For each seed:<br/>track_split"]
+    S --> T{"Official test set given?"}
+    T -- "yes" --> TG["Target: official test"]
+    T -- "no" --> TV["Target: held-out tracks"]
+    TG --> V["For each variant: fit on train,<br/>validation for early stopping"]
+    TV --> V
+    V --> CM["clean_metrics:<br/>accuracy, macro-F1"]
+    V --> CS["corruption_suite:<br/>6 corruptions, severities 1, 3, 5"]
+    CS --> CA["Corrupt accuracy:<br/>mean of the suite"]
+    CS --> MCE["mCE: errors ÷ errors of baseline,<br/>mean over corruptions"]
+    CM --> SUM["Mean and std over seeds,<br/>accuracy by corruption"]
+    CA --> SUM
+    MCE --> SUM
+    SUM --> OUT[/"benchmark.json: variants"/]
+```
 
 | Variant | Training data | Condition input |
 |---|---|---|
@@ -334,11 +561,36 @@ At 32 px, the HOG part has 324 values and the colour part has 27 values.
 
 Each value is the mean and the standard deviation over `SIGNSIGHT_SEEDS` seeds (default 3).
 
+The leakage check trains the `baseline` variant two times on the same data:
+
+```mermaid
+flowchart LR
+    IN[/"ImageSet and the<br/>baseline variant"/] --> IS["image_split:<br/>random, stratified"]
+    IN --> TS["track_split:<br/>StratifiedGroupKFold"]
+    IS --> F1["fit, then accuracy<br/>on its validation part"]
+    TS --> F2["fit, then accuracy<br/>on its validation part"]
+    F1 --> GAP["gap = image_split<br/>− track_split"]
+    F2 --> GAP
+    GAP --> OUT[/"leakage: printed report,<br/>and benchmark.json for benchmark"/]
+```
+
 ---
 
 ## 11. Detection, prediction and latency
 
 **Purpose.** Classify full photos, and measure the time of the full pipeline.
+
+```mermaid
+flowchart TD
+    IN[/"RGB image"/] --> STEP["Use every n-th pixel:<br/>n = long side ÷ 128"]
+    STEP --> MASK["sign_colour_mask:<br/>red, blue or yellow pixels"]
+    MASK --> COMP["_largest_component:<br/>4-connected flood fill"]
+    COMP --> Q{"Area at least 0.2 %<br/>of the small image?"}
+    Q -- "no" --> NONE[/"None: no crop"/]
+    Q -- "yes" --> BOX["Box of the area,<br/>scaled back to full size"]
+    BOX --> PAD["Add 12 % padding,<br/>clip to the image"]
+    PAD --> OUT[/"Box x1, y1, x2, y2"/]
+```
 
 | Detector rule | Value |
 |---|---|
@@ -350,6 +602,16 @@ Each value is the mean and the standard deviation over `SIGNSIGHT_SEEDS` seeds (
 | Padding | 12 % of the box on each side |
 
 `latency` reads each file, detects, crops and classifies one image at a time after 3 warm-up images. It reports the median (p50) and the 95th percentile (p95) in milliseconds for each stage and for the total.
+
+```mermaid
+flowchart LR
+    P[/"Image paths"/] --> W["3 warm-up runs,<br/>not counted"]
+    W --> RD["read:<br/>open, convert to RGB"]
+    RD --> DT["detect"]
+    DT --> CR["crop:<br/>crop_resize"]
+    CR --> CL["classify:<br/>predict_proba"]
+    CL --> REP[/"p50 and p95 ms for each stage<br/>and the total, fps_p50"/]
+```
 
 ---
 
@@ -420,19 +682,49 @@ signsight evaluate --model runs/model.joblib --data data/GTSRB_Final_Training_Im
 | `latency` | Measures the time of each pipeline stage |
 | `make-scenes` | Writes synthetic street-like images with one sign each |
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> TRN["signsight train"]
+    INS --> BEN["signsight benchmark"]
+    INS --> MS["signsight make-scenes"]
+    INS --> DEMO["signsight demo<br/>writes no files"]
+    GT[("GTSRB zip or folder,<br/>optional")] -- "--data" --> TRN
+    GT -- "--data" --> BEN
+    TRN --> MOD[("runs/model.joblib<br/>runs/metrics.json")]
+    BEN --> BJ[("runs/benchmark.json")]
+    MS --> SC[("data/scenes/*.png")]
+    MOD --> EV["signsight evaluate"]
+    MOD --> PR["signsight predict"]
+    MOD --> LA["signsight latency"]
+    SC --> PR
+    SC --> LA
+```
+
 ### 13.4 Environment variables
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `SIGNSIGHT_DATA_DIR` | Settings | Data folder. Default `data` |
+| `SIGNSIGHT_DATA_DIR` | Settings | Data folder. Default `data`. No command reads this value. Give the paths with `--data` and `--images` |
 | `SIGNSIGHT_OUT` | `train`, `benchmark` | Output folder. Default `runs` |
 | `SIGNSIGHT_SEED` | All components | First seed. Default 42 |
-| `SIGNSIGHT_IMAGE_SIZE` | Data, models | Crop size in pixels, a multiple of 8. Default 32 |
+| `SIGNSIGHT_IMAGE_SIZE` | Data, models | Crop size in pixels, a multiple of 8 and at least 16. Default 32 |
 | `SIGNSIGHT_BACKEND` | `train`, `benchmark` | `hog` (default) or `cnn` |
 | `SIGNSIGHT_EPOCHS` | CNN | Maximum epochs. Default 15 |
 | `SIGNSIGHT_SEEDS` | `benchmark`, `demo` | Number of seeds. Default 3 |
 
 The CLI reads a local `.env` file. A variable that is already in the environment wins. A value that is not valid stops the command with `error:`. signsight needs no credentials.
+
+```mermaid
+flowchart LR
+    ENV[/".env file"/] --> LD["load_dotenv:<br/>sets only absent variables"]
+    PENV[/"Process environment"/] --> FE["Settings.from_env"]
+    LD --> FE
+    FE --> CHK{"Values valid?<br/>integers, backend hog or cnn,<br/>image size, epochs, seeds"}
+    CHK -- "yes" --> SET[/"Settings: data_dir, out_dir, seed,<br/>image_size, backend, epochs, seeds"/]
+    CHK -- "no" --> ERR[/"ConfigError: the CLI prints<br/>error: and returns 1"/]
+```
 
 ---
 
